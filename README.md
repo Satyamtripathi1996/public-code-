@@ -1,4 +1,4 @@
-# AWS Nginx + RDS Infrastructure (Eval Project)
+# AWS Nginx + RDS Infrastructure 
 
 ## Overview
 This Terraform setup creates:
