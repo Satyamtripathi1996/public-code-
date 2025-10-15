@@ -1,14 +1,20 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
+# AWS Nginx + RDS Infrastructure (Eval Project)
 
-  required_version = ">= 1.6.0"
-}
+## Overview
+This Terraform setup creates:
+- A multi-AZ VPC
+- An Auto Scaling Nginx web service with ALB
+- A Multi-AZ RDS MySQL database
 
-provider "aws" {
-  region = "us-east-1"
-}
+## Region
+us-east-1 (N. Virginia)
+
+## Deployment Steps
+1. terraform init
+2. terraform validate
+3. terraform plan
+4. terraform apply -auto-approve
+
+## Scaling
+- Scale up at CPU >= 65%
+- Scale down at CPU <= 40%
