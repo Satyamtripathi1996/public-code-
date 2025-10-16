@@ -1,9 +1,9 @@
 variable "vpc_cidr" {
-  description = "CIDR block for the VPC"
+  description = "CIDR block for VPC"
   default     = "10.0.0.0/16"
 }
 
 variable "allowed_ip" {
-  description = "Allowed public IP for SSH/HTTP access"
-  default     = "165.1.207.240" # this is my machine ip 
+  description = "Public IP allowed to access EC2 (replace with your machine IP)"
+  default     = "103.45.67.89/32" #  replace with your actual IP
 }
