@@ -1,6 +1,9 @@
 resource "aws_db_subnet_group" "rds_subnet" {
-  name       = "rds-subnet-group-${random_id.suffix.hex}"
+  name       = "rds-subnet-group"
   subnet_ids = var.private_subnet_ids
+  tags = {
+    Name = "rds-subnet-group"
+  }
 }
 
 resource "aws_security_group" "rds_sg" {
@@ -19,10 +22,14 @@ resource "aws_security_group" "rds_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = {
+    Name = "rds-sg"
+  }
 }
 
 resource "aws_db_instance" "main" {
-  identifier           = "nginx-rds-${random_id.suffix.hex}"
+  identifier           = "nginx-rds"
   engine               = "mysql"
   instance_class       = "db.t3.micro"
   allocated_storage    = 20
@@ -32,6 +39,9 @@ resource "aws_db_instance" "main" {
   skip_final_snapshot  = true
   db_subnet_group_name = aws_db_subnet_group.rds_subnet.name
   vpc_security_group_ids = [aws_security_group.rds_sg.id]
+  tags = {
+    Name = "nginx-rds"
+  }
 }
 
 output "db_endpoint" {
