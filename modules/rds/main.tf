@@ -1,5 +1,5 @@
 resource "aws_db_subnet_group" "rds_subnet" {
-  name       = "rds-subnet-group"
+  name       = "rds-subnet-group-${random_id.suffix.hex}"
   subnet_ids = var.private_subnet_ids
 }
 
@@ -10,7 +10,7 @@ resource "aws_security_group" "rds_sg" {
     from_port   = 3306
     to_port     = 3306
     protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"] # Allow from inside VPC
+    cidr_blocks = ["10.0.0.0/16"]
   }
 
   egress {
@@ -22,7 +22,7 @@ resource "aws_security_group" "rds_sg" {
 }
 
 resource "aws_db_instance" "main" {
-  identifier           = "nginx-rds"
+  identifier           = "nginx-rds-${random_id.suffix.hex}"
   engine               = "mysql"
   instance_class       = "db.t3.micro"
   allocated_storage    = 20
