@@ -1,22 +1,21 @@
-locals { name = var.project }
+locals {
+  name = var.project
+}
 
-resource "aws_security_group" "alb" {
-  name        = "${local.name}-alb-sg"
-  description = "ALB security group"
+# SG: ALB → EC2:80 only. Outbound allowed (internet via NAT).
+resource "aws_security_group" "web" {
+  name        = "${local.name}-web-sg"
+  description = "Only ALB can reach web instances"
   vpc_id      = var.vpc_id
 
   ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = var.allowed_ingress_cidrs
+    description     = "ALB to Nginx"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [var.alb_security_group_id]
   }
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = var.allowed_ingress_cidrs
-  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -24,65 +23,148 @@ resource "aws_security_group" "alb" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = merge(var.tags, { Name = "${local.name}-alb-sg" })
+  tags = merge(var.tags, { Name = "${local.name}-web-sg" })
 }
 
-resource "random_id" "suffix" { byte_length = 4 }
+# Latest Amazon Linux 2 (HVM x86_64)
+data "aws_ami" "al2" {
+  most_recent = true
+  owners      = ["amazon"]
 
-resource "aws_lb" "this" {
-  name               = "${local.name}-alb-${random_id.suffix.hex}"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = var.public_subnet_ids
-  idle_timeout       = 60
-  tags               = merge(var.tags, { Name = "${local.name}-alb" })
-}
-
-resource "aws_lb_target_group" "web" {
-  name         = "${local.name}-tg-${random_id.suffix.hex}"
-  target_type  = "instance"
-  port         = 80
-  protocol     = "HTTP"
-  vpc_id       = var.vpc_id
-
-  health_check {
-    protocol            = "HTTP"
-    path                = "/index.html"   # 👈 nginx user-data se ye file ban rahi hai
-    matcher             = "200-499"       # bootstrap-friendly; stable ke baad 200-399
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-    interval            = 30
-    timeout             = 5
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
   }
-
-  tags = merge(var.tags, { Name = "${local.name}-tg" })
 }
 
-# HTTP -> HTTPS redirect
-resource "aws_lb_listener" "http_redirect" {
-  load_balancer_arn = aws_lb.this.arn
-  port              = 80
-  protocol          = "HTTP"
-  default_action {
-    type = "redirect"
-    redirect {
-      port        = "443"
-      protocol    = "HTTPS"
-      status_code = "HTTP_301"
+# Launch template with robust bootstrap + encrypted gp3 root
+resource "aws_launch_template" "lt" {
+  name_prefix            = "${local.name}-lt-"
+  image_id               = data.aws_ami.al2.id
+  instance_type          = var.instance_type
+  update_default_version = true
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = 10
+      volume_type = "gp3"
+      encrypted   = true
     }
   }
+
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = [aws_security_group.web.id]
+  }
+
+  # ---------- USER DATA ----------
+  user_data = base64encode(<<-EOT
+#!/bin/bash
+set -euxo pipefail
+
+# Retry YUM (handle transient NAT/yum issues)
+for i in {1..5}; do
+  yum -y update && yum -y install nginx && break || sleep 10
+done
+
+systemctl enable nginx || true
+echo "<h1>Hello North, This side Eda.</h1>" > /usr/share/nginx/html/index.html
+systemctl restart nginx
+
+# quick local probe (optional)
+curl -sI http://localhost/ || true
+EOT
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = merge(var.tags, { Name = "${local.name}-web" })
+  }
 }
 
-# HTTPS listener (ACM)
-resource "aws_lb_listener" "https" {
-  load_balancer_arn = aws_lb.this.arn
-  port              = 443
-  protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-2016-08"
-  certificate_arn   = var.acm_certificate_arn
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.web.arn
+# ASG with instance refresh (rolling) + ALB target attachment
+resource "aws_autoscaling_group" "asg" {
+  name                = "${local.name}-asg"
+  min_size            = 1
+  max_size            = 3
+  desired_capacity    = 1
+  vpc_zone_identifier = var.private_subnet_ids
+
+  launch_template {
+    id      = aws_launch_template.lt.id
+    version = "$Default"   # always use LT default version
   }
+
+  target_group_arns         = [var.target_group_arn]
+  health_check_type         = "ELB"        # Use ALB health for replacement
+  health_check_grace_period = 180
+
+  # LT change => Rolling refresh
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+      instance_warmup        = 120
+    }
+    triggers = ["launch_template"]
+  }
+
+  termination_policies = ["OldestInstance"]
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-web"
+    propagate_at_launch = true
+  }
+}
+
+# ---- Scaling Policies ----
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "${local.name}-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 300
+}
+
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "${local.name}-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 300
+}
+
+# ---- CloudWatch Alarms ----
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  alarm_name          = "${local.name}-cpu-high"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120
+  statistic           = "Average"   # required
+  threshold           = 65
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.asg.name
+  }
+  treat_missing_data = "notBreaching"
+  alarm_actions      = [aws_autoscaling_policy.scale_up.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_low" {
+  alarm_name          = "${local.name}-cpu-low"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120
+  statistic           = "Average"   # required
+  threshold           = 40
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.asg.name
+  }
+  treat_missing_data = "breaching"
+  alarm_actions      = [aws_autoscaling_policy.scale_down.arn]
 }
