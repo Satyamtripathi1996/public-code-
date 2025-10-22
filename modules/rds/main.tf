@@ -1,83 +1,60 @@
+locals { name = var.project }
 
-# RDS Module -
-# Creates:
-#   - Random suffix for unique name
-#   - DB Subnet Group (multi-AZ)
-#   - Security Group for DB
-#   - Multi-AZ MySQL RDS Instance
-
-
-# Generate random suffix to avoid name collisions
-resource "random_id" "suffix" {
-  byte_length = 4
-}
-
-# Create a DB subnet group using private subnets
-resource "aws_db_subnet_group" "rds_subnet" {
-  name       = "rds-subnet-group-${random_id.suffix.hex}"
+# DB Subnet Group across private subnets
+resource "aws_db_subnet_group" "this" {
+  name       = "${local.name}-db-subnets"
   subnet_ids = var.private_subnet_ids
-
-  tags = {
-    Name = "rds-subnet-group-${random_id.suffix.hex}"
-    Environment = "sandbox"
-    Project     = "EvalProject-Eda"
-  }
+  tags       = merge(var.tags, { Name = "${local.name}-db-subnets" })
 }
 
-# Security group for RDS
-resource "aws_security_group" "rds_sg" {
+# SG: allow only Postgres from web SG
+resource "aws_security_group" "db" {
+  name   = "${local.name}-db-sg"
   vpc_id = var.vpc_id
 
   ingress {
-    description = "Allow MySQL access from inside VPC"
-    from_port   = 3306
-    to_port     = 3306
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
+    description     = "PostgreSQL from web tier only"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [var.web_sg_id]
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # outbound kept minimal—DB may talk out for patch repos/time/KMS
+  egress { from_port=0 to_port=0 protocol="-1" cidr_blocks=["0.0.0.0/0"] }
 
-  tags = {
-    Name        = "rds-sg"
-    Environment = "sandbox"
-    Project     = "EvalProject-Eda"
-  }
+  tags = merge(var.tags, { Name = "${local.name}-db-sg" })
 }
 
-# Create Multi-AZ RDS MySQL Instance
-resource "aws_db_instance" "main" {
-  identifier             = "nginx-rds-${random_id.suffix.hex}"
-  engine                 = "mysql"
-  engine_version         = "8.0"
-  instance_class         = "db.t3.micro"
-  allocated_storage      = 20
-  max_allocated_storage  = 50
-  username               = "admin"
-  password               = "Password123!"
-  multi_az               = true
-  skip_final_snapshot    = true
-  db_subnet_group_name   = aws_db_subnet_group.rds_subnet.name
-  vpc_security_group_ids = [aws_security_group.rds_sg.id]
-  publicly_accessible    = false
-  backup_retention_period = 1
-  deletion_protection    = false
+resource "aws_db_instance" "this" {
+  identifier              = "${local.name}-postgres"
+  engine                  = "postgres"
+  engine_version          = "15.5"           # stable
+  instance_class          = "db.t3.micro"
+  multi_az                = true
+  allocated_storage       = 20
+  storage_type            = "gp3"
+  storage_encrypted       = true
+  kms_key_id              = var.kms_key_id
+  username                = var.db_username
+  password                = var.db_password
+  db_name                 = var.db_name
+  port                    = 5432
+  db_subnet_group_name    = aws_db_subnet_group.this.name
+  vpc_security_group_ids  = [aws_security_group.db.id]
+  publicly_accessible     = false
+  deletion_protection     = false
+  backup_retention_period = 7
+  copy_tags_to_snapshot   = true
+  auto_minor_version_upgrade = true
+  monitoring_interval     = 0   # can enable enhanced monitoring if needed
+  apply_immediately       = true
 
-  tags = {
-    Name        = "nginx-rds-${random_id.suffix.hex}"
-    Environment = "sandbox"
-    Project     = "EvalProject-Eda"
+  lifecycle {
+    prevent_destroy = false
   }
+
+  tags = merge(var.tags, { Name = "${local.name}-postgres" })
 }
 
-# Output for database endpoint
-output "db_endpoint" {
-  description = "RDS database endpoint"
-  value       = aws_db_instance.main.endpoint
-}
-
+output "db_endpoint" { value = aws_db_instance.this.address }
