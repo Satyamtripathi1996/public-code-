@@ -1,39 +1,100 @@
-resource "aws_vpc" "main" {
-  cidr_block = var.vpc_cidr
-  tags = { Name = "sandbox-vpc" }
+locals { name = var.project }
+
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags = merge(var.tags, { Name = "${local.name}-vpc" })
 }
 
+# Internet Gateway
 resource "aws_internet_gateway" "igw" {
-  vpc_id = aws_vpc.main.id
-  tags   = { Name = "sandbox-igw" }
+  vpc_id = aws_vpc.this.id
+  tags   = merge(var.tags, { Name = "${local.name}-igw" })
 }
 
-resource "aws_subnet" "public_a" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
+# Public subnets (2) - multi AZ
+resource "aws_subnet" "public" {
+  for_each = {
+    a = { az = var.azs[0], cidr = cidrsubnet(var.vpc_cidr, 4, 0) }
+    b = { az = var.azs[1], cidr = cidrsubnet(var.vpc_cidr, 4, 1) }
+  }
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = each.value.cidr
+  availability_zone       = each.value.az
   map_public_ip_on_launch = true
-  availability_zone       = "us-east-1a"
-  tags = { Name = "public-subnet-a" }
+  tags = merge(var.tags, {
+    Name = "${local.name}-public-${each.key}"
+    Tier = "public"
+  })
 }
 
-resource "aws_subnet" "public_b" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.2.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = "us-east-1b"
-  tags = { Name = "public-subnet-b" }
+# Private subnets (2) - multi AZ
+resource "aws_subnet" "private" {
+  for_each = {
+    a = { az = var.azs[0], cidr = cidrsubnet(var.vpc_cidr, 4, 10) }
+    b = { az = var.azs[1], cidr = cidrsubnet(var.vpc_cidr, 4, 11) }
+  }
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = each.value.cidr
+  availability_zone = each.value.az
+  tags = merge(var.tags, {
+    Name = "${local.name}-private-${each.key}"
+    Tier = "private"
+  })
 }
 
-resource "aws_subnet" "private_a" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.3.0/24"
-  availability_zone = "us-east-1a"
-  tags = { Name = "private-subnet-a" }
+# EIPs for NAT (per AZ for HA)
+resource "aws_eip" "nat" {
+  for_each = aws_subnet.public
+  domain   = "vpc"
+  tags     = merge(var.tags, { Name = "${local.name}-nat-eip-${each.key}" })
 }
 
-resource "aws_subnet" "private_b" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.4.0/24"
-  availability_zone = "us-east-1b"
-  tags = { Name = "private-subnet-b" }
+# NAT Gateways (per AZ)
+resource "aws_nat_gateway" "nat" {
+  for_each      = aws_subnet.public
+  allocation_id = aws_eip.nat[each.key].id
+  subnet_id     = aws_subnet.public[each.key].id
+  tags          = merge(var.tags, { Name = "${local.name}-nat-${each.key}" })
+  depends_on    = [aws_internet_gateway.igw]
+}
+
+# Public Route Table + routes + associations
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+  tags   = merge(var.tags, { Name = "${local.name}-public-rt" })
+}
+
+resource "aws_route" "public_igw" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.igw.id
+}
+
+resource "aws_route_table_association" "public_assoc" {
+  for_each       = aws_subnet.public
+  subnet_id      = aws_subnet.public[each.key].id
+  route_table_id = aws_route_table.public.id
+}
+
+# Private Route Tables (per AZ) + NAT routes + associations
+resource "aws_route_table" "private" {
+  for_each = aws_nat_gateway.nat
+  vpc_id   = aws_vpc.this.id
+  tags     = merge(var.tags, { Name = "${local.name}-private-rt-${each.key}" })
+}
+
+resource "aws_route" "private_nat" {
+  for_each               = aws_route_table.private
+  route_table_id         = aws_route_table.private[each.key].id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.nat[each.key].id
+}
+
+resource "aws_route_table_association" "private_assoc" {
+  for_each       = aws_subnet.private
+  subnet_id      = aws_subnet.private[each.key].id
+  # map 'a' private subnet to 'a' NAT RT, etc.
+  route_table_id = aws_route_table.private[each.key].id
 }
