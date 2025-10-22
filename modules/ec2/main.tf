@@ -1,122 +1,116 @@
-resource "random_id" "suffix" {
-  byte_length = 4
-}
+locals { name = var.project }
 
-# --- Security Group ---
-resource "aws_security_group" "web_sg" {
-  vpc_id = var.vpc_id
-
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_ip]
-  }
+# SG for EC2: allow only from ALB on 80; egress via NAT
+resource "aws_security_group" "web" {
+  name        = "${local.name}-web-sg"
+  description = "Only ALB can reach web instances"
+  vpc_id      = var.vpc_id
 
   ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_ip]
+    description     = "ALB to Nginx"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [var.alb_security_group_id]
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # no inbound ssh from internet; if needed, use SSM/Bastion (not included by design)
 
-  tags = { Name = "nginx-sg" }
+  egress { from_port=0 to_port=0 protocol="-1" cidr_blocks=["0.0.0.0/0"] }
+
+  tags = merge(var.tags, { Name = "${local.name}-web-sg" })
 }
 
-# --- Launch Template ---
-resource "aws_launch_template" "nginx" {
-  name_prefix   = "nginx-lt-"
-  image_id      = "ami-0c02fb55956c7d316" # Amazon Linux 2 (us-east-1)
-  instance_type = "t3.micro"
+# Amazon Linux 2 (us-east-1)
+data "aws_ami" "al2" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter { name = "name" values = ["amzn2-ami-hvm-*-x86_64-gp2"] }
+}
+
+# Launch Template with encrypted EBS and user_data (Nginx message)
+resource "aws_launch_template" "lt" {
+  name_prefix   = "${local.name}-lt-"
+  image_id      = data.aws_ami.al2.id
+  instance_type = var.instance_type
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = 10
+      volume_type = "gp3"
+      encrypted   = true
+      kms_key_id  = var.kms_key_id
+    }
+  }
+
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = [aws_security_group.web.id]
+  }
 
   user_data = base64encode(<<-EOF
     #!/bin/bash
+    set -e
     yum update -y
     yum install -y nginx
-    systemctl start nginx
     systemctl enable nginx
-    echo "<h1>Hello from Eda's Auto Scaling Nginx Server!</h1>" > /usr/share/nginx/html/index.html
+    echo "<h1>Hello North, This side Eda.</h1>" > /usr/share/nginx/html/index.html
+    systemctl start nginx
   EOF
   )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = merge(var.tags, { Name = "${local.name}-web" })
+  }
 }
 
-# --- Auto Scaling Group ---
-resource "aws_autoscaling_group" "nginx_asg" {
-  desired_capacity    = 1
+# Auto Scaling Group across private subnets
+resource "aws_autoscaling_group" "asg" {
+  name                = "${local.name}-asg"
   min_size            = 1
   max_size            = 3
-  vpc_zone_identifier = var.public_subnet_ids
+  desired_capacity    = 1
+  vpc_zone_identifier = var.private_subnet_ids
 
   launch_template {
-    id      = aws_launch_template.nginx.id
+    id      = aws_launch_template.lt.id
     version = "$Latest"
   }
 
-  depends_on = [aws_security_group.web_sg]
+  target_group_arns = [var.target_group_arn]
+
+  health_check_type         = "EC2"
+  health_check_grace_period = 120
+  termination_policies      = ["OldestInstance"]
 
   tag {
     key                 = "Name"
-    value               = "nginx-asg"
+    value               = "${local.name}-web"
     propagate_at_launch = true
   }
 }
 
-# --- Load Balancer ---
-resource "aws_lb" "web_alb" {
-  name               = "nginx-alb-${random_id.suffix.hex}"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.web_sg.id]
-  subnets            = var.public_subnet_ids
-}
-
-# --- Target Group ---
-resource "aws_lb_target_group" "web_tg" {
-  name     = "nginx-tg-${random_id.suffix.hex}"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = var.vpc_id
-}
-
-# --- Listener ---
-resource "aws_lb_listener" "web_listener" {
-  load_balancer_arn = aws_lb.web_alb.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.web_tg.arn
-  }
-}
-
-# --- Scaling Policies ---
+# Scaling policies & CloudWatch alarms
 resource "aws_autoscaling_policy" "scale_up" {
-  name                   = "nginx-scale-up"
-  scaling_adjustment     = 1
+  name                   = "${local.name}-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.asg.name
   adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
   cooldown               = 300
-  autoscaling_group_name = aws_autoscaling_group.nginx_asg.name
 }
 
 resource "aws_autoscaling_policy" "scale_down" {
-  name                   = "nginx-scale-down"
-  scaling_adjustment     = -1
+  name                   = "${local.name}-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.asg.name
   adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
   cooldown               = 300
-  autoscaling_group_name = aws_autoscaling_group.nginx_asg.name
 }
 
-# --- CloudWatch Alarms ---
 resource "aws_cloudwatch_metric_alarm" "cpu_high" {
-  alarm_name          = "nginx-high-cpu"
+  alarm_name          = "${local.name}-cpu-high"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 2
   metric_name         = "CPUUtilization"
@@ -124,15 +118,12 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   period              = 120
   statistic           = "Average"
   threshold           = 65
-  alarm_description   = "Scale up when CPU >= 65%"
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.nginx_asg.name
-  }
+  dimensions = { AutoScalingGroupName = aws_autoscaling_group.asg.name }
   alarm_actions = [aws_autoscaling_policy.scale_up.arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "cpu_low" {
-  alarm_name          = "nginx-low-cpu"
+  alarm_name          = "${local.name}-cpu-low"
   comparison_operator = "LessThanOrEqualToThreshold"
   evaluation_periods  = 2
   metric_name         = "CPUUtilization"
@@ -140,13 +131,8 @@ resource "aws_cloudwatch_metric_alarm" "cpu_low" {
   period              = 120
   statistic           = "Average"
   threshold           = 40
-  alarm_description   = "Scale down when CPU <= 40%"
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.nginx_asg.name
-  }
+  dimensions = { AutoScalingGroupName = aws_autoscaling_group.asg.name }
   alarm_actions = [aws_autoscaling_policy.scale_down.arn]
 }
 
-output "alb_dns_name" {
-  value = aws_lb.web_alb.dns_name
-}
+output "web_sg_id" { value = aws_security_group.web.id }
