@@ -40,16 +40,16 @@ resource "aws_lb" "this" {
 }
 
 resource "aws_lb_target_group" "web" {
-  name     = "${local.name}-tg-${random_id.suffix.hex}"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = var.vpc_id
+  name         = "${local.name}-tg-${random_id.suffix.hex}"
+  target_type  = "instance"
+  port         = 80
+  protocol     = "HTTP"
+  vpc_id       = var.vpc_id
 
-  # Relaxed matcher during bootstrap; can tighten later to 200-399
   health_check {
-    path                = "/"
     protocol            = "HTTP"
-    matcher             = "200-499"
+    path                = "/index.html"   # 👈 nginx user-data se ye file ban rahi hai
+    matcher             = "200-499"       # bootstrap-friendly; stable ke baad 200-399
     healthy_threshold   = 2
     unhealthy_threshold = 2
     interval            = 30
