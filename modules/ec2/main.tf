@@ -1,6 +1,5 @@
 locals { name = var.project }
 
-# SG: only ALB -> 80
 resource "aws_security_group" "web" {
   name        = "${local.name}-web-sg"
   description = "Only ALB can reach web instances"
@@ -13,23 +12,28 @@ resource "aws_security_group" "web" {
     protocol        = "tcp"
     security_groups = [var.alb_security_group_id]
   }
+
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   tags = merge(var.tags, { Name = "${local.name}-web-sg" })
 }
 
-# Latest Amazon Linux 2
+# Latest AL2 AMI
 data "aws_ami" "al2" {
   most_recent = true
   owners      = ["amazon"]
-  filter { name = "name" values = ["amzn2-ami-hvm-*-x86_64-gp2"] }
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
 }
 
-# Launch Template (encrypted EBS via AWS-managed KMS)
 resource "aws_launch_template" "lt" {
   name_prefix   = "${local.name}-lt-"
   image_id      = data.aws_ami.al2.id
@@ -40,7 +44,7 @@ resource "aws_launch_template" "lt" {
     ebs {
       volume_size = 10
       volume_type = "gp3"
-      encrypted   = true   # uses AWS-managed key, no kms id needed
+      encrypted   = true  # AWS-managed key
     }
   }
 
@@ -66,7 +70,6 @@ resource "aws_launch_template" "lt" {
   }
 }
 
-# ASG in private subnets
 resource "aws_autoscaling_group" "asg" {
   name                = "${local.name}-asg"
   min_size            = 1
@@ -91,7 +94,7 @@ resource "aws_autoscaling_group" "asg" {
   }
 }
 
-# Scaling policies + alarms (65% / 40%)
+# Scaling: up at 65%, down at 40%
 resource "aws_autoscaling_policy" "scale_up" {
   name                   = "${local.name}-scale-up"
   autoscaling_group_name = aws_autoscaling_group.asg.name
