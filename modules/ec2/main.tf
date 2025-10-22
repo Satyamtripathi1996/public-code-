@@ -97,7 +97,7 @@ resource "aws_autoscaling_group" "asg" {
   }
 
   target_group_arns         = [var.target_group_arn]
-  health_check_type         = "EC2"
+  health_check_type         = "ELB"        # <<< important change
   health_check_grace_period = 180
 
   # LT change => Rolling refresh
@@ -154,10 +154,3 @@ resource "aws_cloudwatch_metric_alarm" "cpu_low" {
   comparison_operator = "LessThanOrEqualToThreshold"
   evaluation_periods  = 2
   metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 120
-  statistic           = "Average"
-  threshold           = 40
-  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.asg.name }
-  alarm_actions       = [aws_autoscaling_policy.scale_down.arn]
-}
