@@ -58,7 +58,7 @@ resource "aws_launch_template" "lt" {
     security_groups             = [aws_security_group.web.id]
   }
 
-  # ---------- USER DATA (no quotes around heredoc tag) ----------
+  # ---------- USER DATA ----------
   user_data = base64encode(<<-EOT
 #!/bin/bash
 set -euxo pipefail
@@ -97,7 +97,7 @@ resource "aws_autoscaling_group" "asg" {
   }
 
   target_group_arns         = [var.target_group_arn]
-  health_check_type         = "ELB"        # <<< important change
+  health_check_type         = "ELB"        # Use ALB health for replacement
   health_check_grace_period = 180
 
   # LT change => Rolling refresh
@@ -119,7 +119,7 @@ resource "aws_autoscaling_group" "asg" {
   }
 }
 
-# Scaling: up at 65%, down at 40%
+# ---- Scaling Policies ----
 resource "aws_autoscaling_policy" "scale_up" {
   name                   = "${local.name}-scale-up"
   autoscaling_group_name = aws_autoscaling_group.asg.name
@@ -136,6 +136,7 @@ resource "aws_autoscaling_policy" "scale_down" {
   cooldown               = 300
 }
 
+# ---- CloudWatch Alarms ----
 resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   alarm_name          = "${local.name}-cpu-high"
   comparison_operator = "GreaterThanOrEqualToThreshold"
@@ -143,10 +144,13 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   metric_name         = "CPUUtilization"
   namespace           = "AWS/EC2"
   period              = 120
-  statistic           = "Average"
+  statistic           = "Average"   # required
   threshold           = 65
-  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.asg.name }
-  alarm_actions       = [aws_autoscaling_policy.scale_up.arn]
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.asg.name
+  }
+  treat_missing_data = "notBreaching"
+  alarm_actions      = [aws_autoscaling_policy.scale_up.arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "cpu_low" {
@@ -154,3 +158,13 @@ resource "aws_cloudwatch_metric_alarm" "cpu_low" {
   comparison_operator = "LessThanOrEqualToThreshold"
   evaluation_periods  = 2
   metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120
+  statistic           = "Average"   # required
+  threshold           = 40
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.asg.name
+  }
+  treat_missing_data = "breaching"
+  alarm_actions      = [aws_autoscaling_policy.scale_down.arn]
+}
