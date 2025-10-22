@@ -6,7 +6,6 @@ resource "aws_db_subnet_group" "this" {
   tags       = merge(var.tags, { Name = "${local.name}-db-subnets" })
 }
 
-# DB SG: only Postgres from web tier
 resource "aws_security_group" "db" {
   name   = "${local.name}-db-sg"
   vpc_id = var.vpc_id
@@ -19,7 +18,6 @@ resource "aws_security_group" "db" {
     security_groups = [var.web_sg_id]
   }
 
-  # minimal egress
   egress {
     from_port   = 0
     to_port     = 0
@@ -38,7 +36,7 @@ resource "aws_db_instance" "this" {
   multi_az                   = true
   allocated_storage          = 20
   storage_type               = "gp3"
-  storage_encrypted          = true            # AWS-managed KMS
+  storage_encrypted          = true
   username                   = var.db_username
   password                   = var.db_password
   db_name                    = var.db_name
@@ -54,5 +52,3 @@ resource "aws_db_instance" "this" {
 
   tags = merge(var.tags, { Name = "${local.name}-postgres" })
 }
-
-output "db_endpoint" { value = aws_db_instance.this.address }
