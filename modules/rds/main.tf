@@ -31,7 +31,6 @@ resource "aws_security_group" "db" {
 resource "aws_db_instance" "this" {
   identifier                 = "${local.name}-postgres"
   engine                     = "postgres"
-  # engine_version           = "15.5"   # <- REMOVE this line to let AWS choose a supported version
   instance_class             = "db.t3.micro"
   multi_az                   = true
   allocated_storage          = 20
