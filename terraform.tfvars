@@ -8,4 +8,5 @@ allowed_ingress_cidrs = [
 acm_certificate_arn = "arn:aws:acm:us-east-1:518249229033:certificate/e1f50669-b43a-4929-b122-91f70e458120"
 
 # Strong DB password
-db_password = "eda@12345"
+db_password = "NorthEda-2025!Secure1"
+
