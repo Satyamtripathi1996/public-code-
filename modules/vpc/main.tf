@@ -7,7 +7,6 @@ resource "aws_vpc" "this" {
   tags = merge(var.tags, { Name = "${local.name}-vpc" })
 }
 
-# Internet access
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.this.id
   tags   = merge(var.tags, { Name = "${local.name}-igw" })
@@ -49,11 +48,11 @@ resource "aws_nat_gateway" "nat" {
   for_each      = aws_subnet.public
   allocation_id = aws_eip.nat[each.key].id
   subnet_id     = aws_subnet.public[each.key].id
-  tags          = merge(var.tags, { Name = "${local.name}-nat-${each.key}" })
   depends_on    = [aws_internet_gateway.igw]
+  tags          = merge(var.tags, { Name = "${local.name}-nat-${each.key}" })
 }
 
-# Public RT + IGW route + associations
+# Public route table
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.this.id
   tags   = merge(var.tags, { Name = "${local.name}-public-rt" })
@@ -71,7 +70,7 @@ resource "aws_route_table_association" "public_assoc" {
   route_table_id = aws_route_table.public.id
 }
 
-# Private RTs per AZ + NAT routes + associations
+# Private route tables (per AZ) + NAT route
 resource "aws_route_table" "private" {
   for_each = aws_nat_gateway.nat
   vpc_id   = aws_vpc.this.id
