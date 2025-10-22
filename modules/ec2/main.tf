@@ -1,5 +1,6 @@
 locals { name = var.project }
 
+# SG: ALB → EC2:80 only. Egress open (outbound internet via NAT).
 resource "aws_security_group" "web" {
   name        = "${local.name}-web-sg"
   description = "Only ALB can reach web instances"
@@ -23,7 +24,7 @@ resource "aws_security_group" "web" {
   tags = merge(var.tags, { Name = "${local.name}-web-sg" })
 }
 
-# Latest AL2 AMI
+# Latest Amazon Linux 2 (HVM x86_64)
 data "aws_ami" "al2" {
   most_recent = true
   owners      = ["amazon"]
@@ -34,17 +35,19 @@ data "aws_ami" "al2" {
   }
 }
 
+# Launch template with robust bootstrap + encrypted gp3 root
 resource "aws_launch_template" "lt" {
-  name_prefix   = "${local.name}-lt-"
-  image_id      = data.aws_ami.al2.id
-  instance_type = var.instance_type
+  name_prefix             = "${local.name}-lt-"
+  image_id                = data.aws_ami.al2.id
+  instance_type           = var.instance_type
+  update_default_version  = true   # LT changes roll forward automatically
 
   block_device_mappings {
     device_name = "/dev/xvda"
     ebs {
       volume_size = 10
       volume_type = "gp3"
-      encrypted   = true  # AWS-managed key
+      encrypted   = true
     }
   }
 
@@ -53,15 +56,23 @@ resource "aws_launch_template" "lt" {
     security_groups             = [aws_security_group.web.id]
   }
 
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    set -e
-    yum update -y
-    yum install -y nginx
-    systemctl enable nginx
-    echo "<h1>Hello North, This side Eda.</h1>" > /usr/share/nginx/html/index.html
-    systemctl start nginx
-  EOF
+  # --- ROBUST USER-DATA (yum retries, idempotent) ---
+  user_data = base64encode(<<'EOF'
+#!/bin/bash
+set -euxo pipefail
+
+# Sometimes NAT/yum is slow; retry to avoid bootstrap failures
+for i in {1..5}; do
+  yum -y update && yum -y install nginx && break || sleep 10
+done
+
+systemctl enable nginx || true
+echo "<h1>Hello North, This side Eda.</h1>" > /usr/share/nginx/html/index.html
+systemctl restart nginx
+
+# quick local health probe (optional)
+curl -sI http://localhost/ || true
+EOF
   )
 
   tag_specifications {
@@ -70,6 +81,7 @@ resource "aws_launch_template" "lt" {
   }
 }
 
+# ASG with instance refresh (rolling) + grace period
 resource "aws_autoscaling_group" "asg" {
   name                = "${local.name}-asg"
   min_size            = 1
@@ -79,13 +91,24 @@ resource "aws_autoscaling_group" "asg" {
 
   launch_template {
     id      = aws_launch_template.lt.id
-    version = "$Latest"
+    version = "$Default"   # always use LT default
   }
 
-  target_group_arns            = [var.target_group_arn]
-  health_check_type            = "EC2"
-  health_check_grace_period    = 120
-  termination_policies         = ["OldestInstance"]
+  target_group_arns         = [var.target_group_arn]
+  health_check_type         = "EC2"
+  health_check_grace_period = 180
+
+  # Any LT change ⇒ rolling replacement
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+      instance_warmup        = 120
+    }
+    triggers = ["launch_template"]
+  }
+
+  termination_policies = ["OldestInstance"]
 
   tag {
     key                 = "Name"
