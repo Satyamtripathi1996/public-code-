@@ -1,13 +1,11 @@
-locals {
-  name = var.project
-}
+locals { name = var.project }
 
-# SG: ALB → EC2:80 only. Outbound allowed (internet via NAT).
 resource "aws_security_group" "web" {
   name        = "${local.name}-web-sg"
-  description = "Only ALB can reach web instances"
+  description = "Only ALB and Bastion can reach web instances"
   vpc_id      = var.vpc_id
 
+  # ALB → HTTP :80
   ingress {
     description     = "ALB to Nginx"
     from_port       = 80
@@ -16,6 +14,16 @@ resource "aws_security_group" "web" {
     security_groups = [var.alb_security_group_id]
   }
 
+  # NEW: SSH only from Bastion SG (no world-open)
+  ingress {
+    description     = "SSH from bastion"
+    from_port       = 22
+    to_port         = 22
+    protocol        = "tcp"
+    security_groups = [var.bastion_sg_id]
+  }
+
+  # Egress: allow all (out to NAT → internet)
   egress {
     from_port   = 0
     to_port     = 0
@@ -26,18 +34,13 @@ resource "aws_security_group" "web" {
   tags = merge(var.tags, { Name = "${local.name}-web-sg" })
 }
 
-# Latest Amazon Linux 2 (HVM x86_64)
+# Latest AL2
 data "aws_ami" "al2" {
   most_recent = true
   owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
-  }
+  filter { name = "name" values = ["amzn2-ami-hvm-*-x86_64-gp2"] }
 }
 
-# Launch template with robust bootstrap + encrypted gp3 root
 resource "aws_launch_template" "lt" {
   name_prefix            = "${local.name}-lt-"
   image_id               = data.aws_ami.al2.id
@@ -58,21 +61,15 @@ resource "aws_launch_template" "lt" {
     security_groups             = [aws_security_group.web.id]
   }
 
-  # ---------- USER DATA ----------
   user_data = base64encode(<<-EOT
 #!/bin/bash
 set -euxo pipefail
-
-# Retry YUM (handle transient NAT/yum issues)
 for i in {1..5}; do
   yum -y update && yum -y install nginx && break || sleep 10
 done
-
 systemctl enable nginx || true
 echo "<h1>Hello North, This side Eda.</h1>" > /usr/share/nginx/html/index.html
 systemctl restart nginx
-
-# quick local probe (optional)
 curl -sI http://localhost/ || true
 EOT
   )
@@ -83,7 +80,6 @@ EOT
   }
 }
 
-# ASG with instance refresh (rolling) + ALB target attachment
 resource "aws_autoscaling_group" "asg" {
   name                = "${local.name}-asg"
   min_size            = 1
@@ -93,14 +89,13 @@ resource "aws_autoscaling_group" "asg" {
 
   launch_template {
     id      = aws_launch_template.lt.id
-    version = "$Default"   # always use LT default version
+    version = "$Default"
   }
 
   target_group_arns         = [var.target_group_arn]
-  health_check_type         = "ELB"        # Use ALB health for replacement
+  health_check_type         = "EC2"
   health_check_grace_period = 180
 
-  # LT change => Rolling refresh
   instance_refresh {
     strategy = "Rolling"
     preferences {
@@ -119,7 +114,6 @@ resource "aws_autoscaling_group" "asg" {
   }
 }
 
-# ---- Scaling Policies ----
 resource "aws_autoscaling_policy" "scale_up" {
   name                   = "${local.name}-scale-up"
   autoscaling_group_name = aws_autoscaling_group.asg.name
@@ -136,7 +130,6 @@ resource "aws_autoscaling_policy" "scale_down" {
   cooldown               = 300
 }
 
-# ---- CloudWatch Alarms ----
 resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   alarm_name          = "${local.name}-cpu-high"
   comparison_operator = "GreaterThanOrEqualToThreshold"
@@ -144,13 +137,10 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   metric_name         = "CPUUtilization"
   namespace           = "AWS/EC2"
   period              = 120
-  statistic           = "Average"   # required
+  statistic           = "Average"
   threshold           = 65
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.asg.name
-  }
-  treat_missing_data = "notBreaching"
-  alarm_actions      = [aws_autoscaling_policy.scale_up.arn]
+  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.asg.name }
+  alarm_actions       = [aws_autoscaling_policy.scale_up.arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "cpu_low" {
@@ -160,11 +150,8 @@ resource "aws_cloudwatch_metric_alarm" "cpu_low" {
   metric_name         = "CPUUtilization"
   namespace           = "AWS/EC2"
   period              = 120
-  statistic           = "Average"   # required
+  statistic           = "Average"
   threshold           = 40
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.asg.name
-  }
-  treat_missing_data = "breaching"
-  alarm_actions      = [aws_autoscaling_policy.scale_down.arn]
+  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.asg.name }
+  alarm_actions       = [aws_autoscaling_policy.scale_down.arn]
 }
